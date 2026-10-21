@@ -1,0 +1,120 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>LanScope · 局域网设备管家</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Ccircle cx='12' cy='12' r='10' fill='none' stroke='%234f8cff' stroke-width='2'/%3E%3Ccircle cx='12' cy='12' r='5' fill='none' stroke='%234f8cff' stroke-width='2'/%3E%3Cpath d='M12 12L19 5' stroke='%233ecf8e' stroke-width='2'/%3E%3Ccircle cx='12' cy='12' r='1.5' fill='%233ecf8e'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round">
+        <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="5"/>
+        <path d="M12 12L19 5"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/>
+      </svg>
+    </span>
+    <span class="brand-text"><b>LanScope</b><i>局域网设备管家</i></span>
+  </div>
+  <div class="net-info" id="netInfo">正在识别网络环境…</div>
+  <div class="top-actions">
+    <nav class="tabs">
+      <button class="tab active" data-tab="devices">设备</button>
+      <button class="tab" data-tab="events">事件<span id="eventBadge" class="badge hidden"></span></button>
+      <button class="tab" data-tab="settings">设置</button>
+    </nav>
+    <button id="btnScan" class="btn btn-primary">立即扫描</button>
+  </div>
+</header>
+
+<main>
+  <section id="tab-devices" class="tabpane active">
+    <div class="stats-row" id="statsRow"></div>
+    <div id="unknownBanner" class="banner hidden"></div>
+    <div id="scanStatus" class="scan-status"></div>
+    <div id="deviceGrid" class="device-grid"></div>
+    <div id="emptyState" class="empty hidden">
+      <div class="empty-icon">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round">
+          <circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="5"/>
+          <path d="M12 12L19 5"/><circle cx="12" cy="12" r="1.2" fill="currentColor"/>
+        </svg>
+      </div>
+      <p>尚未扫描。点击右上角「立即扫描」探测当前网段。</p>
+    </div>
+  </section>
+
+  <section id="tab-events" class="tabpane">
+    <div class="events-toolbar">
+      <select id="eventFilter" class="select">
+        <option value="all">全部事件</option>
+        <option value="unread">未读</option>
+        <option value="alerts">仅告警</option>
+      </select>
+      <button id="btnReadAll" class="btn btn-ghost">全部标为已读</button>
+    </div>
+    <div id="eventList" class="event-list"></div>
+  </section>
+
+  <section id="tab-settings" class="tabpane">
+    <div class="settings-grid">
+      <div class="card">
+        <h3>巡检与安全</h3>
+        <div class="form-row"><label>巡检间隔（秒）</label><input id="sInterval" type="number" min="60" step="30"></div>
+        <div class="form-row"><label>端口扫描</label><input id="sPorts" type="checkbox" class="switch"></div>
+        <div class="form-row"><label>被动嗅探（重启控制台后生效）</label><input id="sSniffer" type="checkbox" class="switch"></div>
+        <div class="form-row"><label>告警系统弹窗</label><input id="sToast" type="checkbox" class="switch"></div>
+        <button id="btnSaveSettings" class="btn btn-primary">保存设置</button>
+      </div>
+      <div class="card">
+        <h3>MAC 厂商库</h3>
+        <div id="ouiStatus" class="muted small-text"></div>
+        <button id="btnOuiRefresh" class="btn btn-ghost">立即更新</button>
+      </div>
+      <div class="card">
+        <h3>设备台账</h3>
+        <p class="muted small-text">把当前已录入的全部设备标记为已知（白名单），此后新出现的 MAC 才触发新设备告警。</p>
+        <button id="btnMarkAll" class="btn btn-ghost">全部标记为已知</button>
+      </div>
+      <div class="card">
+        <h3>关于</h3>
+        <div id="aboutInfo" class="muted small-text"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<aside id="drawer" class="drawer">
+  <div class="drawer-head">
+    <div id="drawerIcon" class="type-icon"></div>
+    <div class="drawer-title">
+      <div id="drawerName" class="drawer-name"></div>
+      <div id="drawerSub" class="drawer-sub"></div>
+    </div>
+    <button id="btnCloseDrawer" class="icon-btn" title="关闭">×</button>
+  </div>
+  <div class="drawer-body">
+    <div class="drawer-section"><h4>信息</h4><div id="drawerInfo" class="info-list"></div></div>
+    <div class="drawer-section">
+      <h4>备注与标记</h4>
+      <div class="form-row"><label>自定义名称</label><input id="fName" type="text" placeholder="如：客厅电视"></div>
+      <div class="form-row"><label>设备类型</label><select id="fType" class="select"></select></div>
+      <div class="form-row"><label>备注</label><input id="fNotes" type="text" placeholder="自由备注"></div>
+      <div class="form-row"><label>已知设备（白名单）</label><input id="fKnown" type="checkbox" class="switch"></div>
+      <div class="form-row"><label>星标</label><input id="fStar" type="checkbox" class="switch"></div>
+      <button id="btnSaveDevice" class="btn btn-primary">保存</button>
+    </div>
+    <div class="drawer-section"><h4>开放端口与服务</h4><div id="drawerPorts"></div></div>
+    <div class="drawer-section"><h4>近 24 小时在线时段</h4><div id="drawerTimeline" class="timeline"></div></div>
+    <div class="drawer-section"><h4>相关事件</h4><div id="drawerEvents" class="event-list small"></div></div>
+  </div>
+</aside>
+<div id="drawerMask" class="drawer-mask hidden"></div>
+<div id="toasts" class="toasts"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
