@@ -136,12 +136,22 @@ def cmd_recon(args) -> int:
 def _print_recon(report) -> None:
     print(f"\n深度侦察报告：{report['ip']}（{report['mac']}）")
     skipped = ",".join(map(str, report.get("skipped_ports", [])))
+    engine = "nmap 版本识别" if report.get("engine") == "nmap" else "内置探针"
     print(
         f"耗时 {report['duration']} 秒｜开放端口 {report['open_count']} 个"
-        f"｜跳过端口 {skipped}（本机安全软件劫持，防假阳性）"
+        f"｜引擎：{engine}｜跳过端口 {skipped}（本机安全软件劫持，防假阳性）"
     )
     osinfo = report.get("os") or {}
-    print(f"OS 猜测：{osinfo.get('guess') or '未知'}（{osinfo.get('basis') or '—'}）")
+    os_line = f"OS 猜测：{osinfo.get('guess') or '未知'}（{osinfo.get('basis') or '—'}）"
+    if osinfo.get("nmap"):
+        os_line += f"｜nmap：{osinfo['nmap']}"
+    print(os_line)
+    snmp = report.get("snmp") or {}
+    if snmp:
+        print(
+            f"SNMP：sysName={snmp.get('sysName', '')}"
+            f"｜sysDescr={(snmp.get('sysDescr') or '')[:80]}"
+        )
     findings = report.get("findings") or []
     if findings:
         print("\n风险发现：")
@@ -155,17 +165,25 @@ def _print_recon(report) -> None:
         print("\n漏洞签名命中：")
         for v in vulns:
             cve = f"{v['cve']} " if v.get("cve") else ""
+            where = "设备级" if v["port"] == 0 else f"端口 {v['port']}"
             print(
                 f"  [{v['severity']}] {cve}{v['name']}"
-                f"——端口 {v['port']}｜证据：{v['evidence']}"
+                f"——{where}｜证据：{v['evidence']}"
             )
     ports = report.get("ports") or []
     if ports:
-        shown = ", ".join(
-            str(p["port"]) + (f"({p['service']})" if p.get("service") else "")
-            for p in ports[:40]
-        )
-        print(f"\n开放端口：{shown}")
+        parts = []
+        for p in ports[:40]:
+            label = str(p["port"])
+            extra = p.get("service") or ""
+            if p.get("product"):
+                extra += " " + p["product"]
+                if p.get("version"):
+                    extra += " " + p["version"]
+            if extra:
+                label += f"({extra.strip()})"
+            parts.append(label)
+        print(f"\n开放端口：{', '.join(parts)}")
     print(f"\nKali 衔接：{report.get('kali_hint', '')}")
 
 

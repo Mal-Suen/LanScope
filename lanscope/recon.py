@@ -114,8 +114,8 @@ def http_probe(
 ) -> Dict[str, Any]:
     """GET / 并解析状态码、Server 头、标题、登录页特征。"""
     out: Dict[str, Any] = {
-        "status": 0, "server": "", "title": "", "login_page": False,
-        "body_bytes": 0, "cert": [],
+        "status": 0, "server": "", "x_powered_by": "", "title": "",
+        "login_page": False, "body_bytes": 0, "cert": [],
     }
     try:
         raw = socket.create_connection((ip, port), timeout=timeout)
@@ -157,8 +157,11 @@ def http_probe(
     for line in head.splitlines()[1:]:
         if ":" in line:
             k, _, v = line.partition(":")
-            if k.strip().lower() == "server":
+            low_key = k.strip().lower()
+            if low_key == "server":
                 out["server"] = v.strip()[:120]
+            elif low_key == "x-powered-by":
+                out["x_powered_by"] = v.strip()[:120]
     tm = re.search(r"<title[^>]*>(.*?)</title>", body, re.I | re.S)
     if tm:
         out["title"] = re.sub(r"\s+", " ", tm.group(1)).strip()[:80]
@@ -182,39 +185,144 @@ def _service_from_banner(banner: str, fallback: str) -> str:
         return "telnet"
     if "rtsp" in low:
         return "rtsp"
+    if "rfb" in low:
+        return "vnc"
+    if "mysql" in low or "mariadb" in low:
+        return "mysql"
+    if banner.startswith("\x16\x03") or banner.startswith("\x15\x03"):
+        return "tls"
     return fallback
 
 
 def fingerprint_port(ip: str, port: int, timeout: float = 3.0) -> Dict[str, Any]:
-    """识别单个开放端口：服务名、banner、HTTP/HTTPS 信息。"""
+    """识别单个开放端口：服务名、banner、HTTP/HTTPS、TLS 证书、协议探针。"""
     info: Dict[str, Any] = {
         "port": port,
         "service": PORT_NAMES.get(port, ""),
         "banner": "",
         "http": None,
+        "product": "",
+        "version": "",
+        "extrainfo": "",
+        "cert": [],
     }
     if port in _HTTP_GUESS or port in _TLS_PORTS:
         http = http_probe(ip, port, use_tls=port in _TLS_PORTS, timeout=timeout)
         if http:
             info["http"] = http
-            info["service"] = info["service"] or "https" if port in _TLS_PORTS else (info["service"] or "http")
+            info["cert"] = http.get("cert", [])
+            info["service"] = info["service"] or (
+                "https" if port in _TLS_PORTS else "http"
+            )
             return info
     if port in _PREBANNER_PORTS:
         info["banner"] = grab_banner(ip, port, timeout)
         if info["banner"]:
             info["service"] = _service_from_banner(info["banner"], info["service"])
             return info
-    # 未知端口：先试 HTTP（嵌入式 Web 常在怪端口），再等 banner
+    # 未知端口：HTTP 试探 → 协议探针 → TLS 证书 → banner 等待
     http = http_probe(ip, port, timeout=2.0)
     if http:
         info["http"] = http
         info["service"] = info["service"] or "http"
-    else:
+        return info
+    proto = probe_unknown_port(ip, port, timeout=1.5)
+    if proto and proto.get("service"):
+        info["service"] = proto["service"]
+        info["banner"] = proto.get("banner", "")
+        return info
+    if proto and proto.get("banner"):
+        info["banner"] = proto["banner"]
+    tls = tls_probe(ip, port, timeout=2.0)
+    if tls["tls"]:
+        info["service"] = "tls"
+        info["cert"] = tls["cert"]
+        info["banner"] = "TLS" + (
+            f"（证书：{' / '.join(tls['cert'])}）" if tls["cert"] else ""
+        )
+        return info
+    if not info["banner"]:
         b = grab_banner(ip, port, timeout=1.5)
         if b:
             info["banner"] = b
             info["service"] = _service_from_banner(b, info["service"])
     return info
+
+
+# ---------- 协议探测库 ----------
+
+_MQTT_CONNECT = (
+    b"\x10\x1a"                      # CONNECT, 剩余长度 26
+    b"\x00\x04MQTT\x04\x02\x00\x3c"  # 协议名/级别4/清洁会话/保活60
+    b"\x00\x0elanscope-probe"         # 客户端 ID
+)
+
+
+def _smb_negotiate() -> bytes:
+    """SMB1 协商请求（无方言），任何 SMB 响应都含 \\xffSMB。"""
+    payload = b"\xffSMB\x72" + b"\x00" * 25 + b"\x00" + b"\x00\x00"
+    return b"\x00" + len(payload).to_bytes(2, "big") + payload
+
+
+def probe_unknown_port(
+    ip: str, port: int, timeout: float = 1.5
+) -> Optional[Dict[str, Any]]:
+    """对未识别端口依次发送协议握手，命中即返回；全部未中但有响应则带回 banner。"""
+    probes = [
+        ("rtsp", b"OPTIONS * RTSP/1.0\r\nCSeq: 1\r\n\r\n",
+         rb"RTSP/[\d.]+\s+\d{3}"),
+        ("sip",
+         b"OPTIONS sip:probe@lan SIP/2.0\r\nVia: SIP/2.0/UDP lanscope\r\n"
+         b"From: <sip:probe@lan>\r\nTo: <sip:probe@lan>\r\nCall-ID: ls\r\n"
+         b"CSeq: 1 OPTIONS\r\nContent-Length: 0\r\n\r\n",
+         rb"SIP/2\.0\s+\d{3}"),
+        ("redis", b"PING\r\n",
+         rb"^\+PONG|^-(NOAUTH|ERR|DENIED|WRONG|AUTH)"),
+        ("mqtt", _MQTT_CONNECT, rb"^\x20"),
+        ("smb", _smb_negotiate(), rb"\xffSMB"),
+    ]
+    fallback_banner = ""
+    for name, payload, pattern in probes:
+        try:
+            s = socket.create_connection((ip, port), timeout=timeout)
+            s.settimeout(timeout)
+            s.sendall(payload)
+            data = s.recv(256)
+            s.close()
+        except OSError:
+            continue
+        if not data:
+            continue
+        if re.search(pattern, data, re.S):
+            return {
+                "service": name,
+                "banner": data.decode("utf-8", errors="replace").strip()[:200],
+            }
+        if not fallback_banner:
+            fallback_banner = data.decode("utf-8", errors="replace").strip()[:200]
+    if fallback_banner:
+        return {"service": "", "banner": fallback_banner}
+    return None
+
+
+def tls_probe(ip: str, port: int, timeout: float = 2.0) -> Dict[str, Any]:
+    """仅做 TLS 握手提取证书（不发应用数据），识别 TLS 服务。"""
+    out: Dict[str, Any] = {"tls": False, "cert": []}
+    try:
+        raw = socket.create_connection((ip, port), timeout=timeout)
+        raw.settimeout(timeout)
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        s = ctx.wrap_socket(raw, server_hostname=ip)
+        der = s.getpeercert(binary_form=True)
+        out["tls"] = True
+        if der:
+            out["cert"] = _cert_subjects(der)
+        s.close()
+    except OSError:
+        pass
+    return out
 
 
 def fingerprint_all(
@@ -254,6 +362,207 @@ def os_fingerprint(ip: str, timeout: float = 4.0) -> Dict[str, Any]:
     return out
 
 
+# ---------- SNMP 探测 ----------
+
+_SYSDESCR_OID = "1.3.6.1.2.1.1.1.0"
+_SYSNAME_OID = "1.3.6.1.2.1.1.5.0"
+
+
+def _ber_len(n: int) -> bytes:
+    if n < 0x80:
+        return bytes([n])
+    out = []
+    while n:
+        out.insert(0, n & 0xFF)
+        n >>= 8
+    return bytes([0x80 | len(out)]) + bytes(out)
+
+
+def _ber_tlv(tag: int, value: bytes) -> bytes:
+    return bytes([tag]) + _ber_len(len(value)) + value
+
+
+def _oid_encode(oid: str) -> bytes:
+    parts = [int(x) for x in oid.split(".")]
+    out = bytes([40 * parts[0] + parts[1]])
+    for p in parts[2:]:
+        if p == 0:
+            out += b"\x00"
+            continue
+        stack = []
+        while p:
+            stack.insert(0, p & 0x7F)
+            p >>= 7
+        for i in range(1, len(stack)):
+            stack[i] |= 0x80
+        out += bytes(stack)
+    return out
+
+
+def _snmp_get_request(oids, community: str = "public") -> bytes:
+    """构造 SNMP v2c GET 请求（version 字段 1＝v2c）。"""
+    varbinds = b""
+    for oid in oids:
+        varbinds += _ber_tlv(
+            0x30, _ber_tlv(0x06, _oid_encode(oid)) + _ber_tlv(0x05, b"")
+        )
+    pdu = (
+        _ber_tlv(0x02, b"\x01")       # request-id
+        + _ber_tlv(0x02, b"\x00")     # error-status
+        + _ber_tlv(0x02, b"\x00")     # error-index
+        + _ber_tlv(0x30, varbinds)
+    )
+    msg = (
+        _ber_tlv(0x02, b"\x01")
+        + _ber_tlv(0x04, community.encode())
+        + _ber_tlv(0xA0, pdu)
+    )
+    return _ber_tlv(0x30, msg)
+
+
+def _ber_parse(buf: bytes):
+    """极简 TLV 解析，返回 (tag, value, rest) 或 None。"""
+    if len(buf) < 2:
+        return None
+    tag = buf[0]
+    i = 1
+    first = buf[i]
+    i += 1
+    if first < 0x80:
+        length = first
+    else:
+        n = first & 0x7F
+        if i + n > len(buf):
+            return None
+        length = int.from_bytes(buf[i:i + n], "big")
+        i += n
+    if i + length > len(buf):
+        return None
+    return tag, buf[i:i + length], buf[i + length:]
+
+
+def _snmp_parse_response(data: bytes) -> Dict[str, str]:
+    """从 v2c GET 响应中提取 sysDescr/sysName。"""
+    out: Dict[str, str] = {}
+    targets = {
+        _oid_encode(_SYSDESCR_OID): "sysDescr",
+        _oid_encode(_SYSNAME_OID): "sysName",
+    }
+
+    def walk(buf: bytes) -> None:
+        while buf:
+            parsed = _ber_parse(buf)
+            if not parsed:
+                return
+            tag, value, buf = parsed
+            if tag == 0x30 or (0xA0 <= tag <= 0xAF):  # SEQUENCE / PDU
+                inner = _ber_parse(value)
+                if inner and inner[0] == 0x06:  # OID 开头的序列 → varbind
+                    oid_val, rest = inner[1], inner[2]
+                    nxt = _ber_parse(rest)
+                    if nxt and nxt[0] == 0x04:
+                        name = targets.get(oid_val)
+                        if name:
+                            out[name] = nxt[1].decode(
+                                "utf-8", errors="replace"
+                            )[:200]
+                walk(value)
+
+    walk(data)
+    return out
+
+
+def snmp_probe(
+    ip: str, community: str = "public", timeout: float = 2.0
+) -> Dict[str, str]:
+    """SNMP v2c GET sysDescr/sysName——家用路由器/摄像头/打印机常开 public 社区名。"""
+    out: Dict[str, str] = {}
+    pkt = _snmp_get_request([_SYSDESCR_OID, _SYSNAME_OID], community)
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.settimeout(timeout)
+        sock.sendto(pkt, (ip, 161))
+        data, _ = sock.recvfrom(4096)
+        out = _snmp_parse_response(data)
+    except OSError:
+        pass
+    finally:
+        if sock:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    return out
+
+
+# ---------- nmap 桥接（可选依赖） ----------
+
+
+def _nmap_available() -> Optional[str]:
+    try:
+        import shutil
+
+        return shutil.which("nmap")
+    except Exception:
+        return None
+
+
+def _is_admin() -> bool:
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def nmap_version_scan(
+    ip: str, ports: List[int], timeout: int = 150
+) -> Optional[Dict[str, Any]]:
+    """本机装有 nmap 时跑 -sV（管理员再加 -O）版本识别，解析 XML 合并进报告。"""
+    exe = _nmap_available()
+    if not exe or not ports:
+        return None
+    import subprocess as sp
+    import xml.etree.ElementTree as ET
+
+    port_list = ",".join(str(p) for p in ports[:200])
+    cmd = [exe, "-sV", "--version-light", "-Pn", "-p", port_list, "-oX", "-", ip]
+    if _is_admin():
+        cmd.insert(1, "-O")
+    try:
+        proc = sp.run(cmd, capture_output=True, timeout=timeout)
+        return _nmap_parse_xml(proc.stdout.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def _nmap_parse_xml(text: str) -> Dict[str, Any]:
+    """解析 nmap -oX 输出：端口服务/产品/版本与 OS 猜测。"""
+    import xml.etree.ElementTree as ET
+
+    root = ET.fromstring(text)
+    result: Dict[str, Any] = {"ports": {}, "os": ""}
+    for pnode in root.iter("port"):
+        try:
+            portid = int(pnode.get("portid", "0"))
+        except ValueError:
+            continue
+        svc = pnode.find("service")
+        if svc is not None:
+            result["ports"][portid] = {
+                "service": svc.get("name", "") or "",
+                "product": svc.get("product", "") or "",
+                "version": svc.get("version", "") or "",
+                "extrainfo": svc.get("extrainfo", "") or "",
+            }
+    osmatch = root.find(".//osmatch")
+    if osmatch is not None:
+        result["os"] = osmatch.get("name", "") or ""
+    return result
+
+
 # ---------- 暴露面风险规则 ----------
 
 RISK_RULES = [
@@ -263,6 +572,8 @@ RISK_RULES = [
      "message": "ADB 调试接口暴露（Android）——可被直接控制设备"},
     {"ports": [7547], "severity": "critical", "type": "tr069",
      "message": "TR-069/CWMP 运维接口暴露——Mirai 变种的重点攻击面"},
+    {"ports": [8291], "severity": "high", "type": "winbox",
+     "message": "MikroTik Winbox 管理端口暴露——CVE-2018-14847 凭据提取的利用面"},
     {"ports": [37215], "severity": "critical", "type": "huawei-upnp",
      "message": "华为设备 UPnP 端口开放——历史 RCE（CVE-2017-17215）利用面"},
     {"ports": [2375], "severity": "high", "type": "docker",
@@ -330,48 +641,114 @@ def assess_risks(port_infos: List[Dict[str, Any]], osinfo: Dict[str, Any]) -> Li
 # ---------- 已知漏洞签名（精选快照，可自行扩充） ----------
 
 VULN_SIGNATURES = [
+    # —— 后门与著名 RCE ——
     {"pattern": r"vsftpd\s+2\.3\.4", "cve": "CVE-2011-2523",
      "severity": "critical", "name": "vsftpd 2.3.4 后门",
      "desc": "官方源码服务器被入侵期间植入的后门版本"},
+    {"pattern": r"ProFTPD\s+1\.3\.5(?!\d)", "cve": "CVE-2015-3306",
+     "severity": "critical", "name": "ProFTPD mod_copy 任意文件写入",
+     "desc": "1.3.5 系列的 mod_copy 模块可写任意路径，常被用于投放网页后门"},
+    {"pattern": r"Apache/2\.4\.(49|50)", "cve": "CVE-2021-42013",
+     "severity": "critical", "name": "Apache 路径穿越/RCE",
+     "desc": "2.4.49/2.4.50 的路径穿越（41773 修复不完整演化为 42013），可导致 RCE"},
+    {"pattern": r"ThinkPHP[/ ]?5\.[01]\.", "cve": "",
+     "severity": "critical", "name": "ThinkPHP 5.x 远程代码执行",
+     "desc": "5.0/5.1 系列控制器调用未过滤（无 CVE 编号的著名 RCE）"},
+    # —— 命令注入 ——
     {"pattern": r"MiniUPnPd/1\.[0-4](?!\d)", "cve": "CVE-2014-8361",
      "severity": "high", "name": "MiniUPnPd SOAP 命令注入",
      "desc": "1.4 及以下版本的 SOAP 接口可注入命令"},
     {"pattern": r"MiniIGD", "cve": "CVE-2016-10372",
      "severity": "high", "name": "Realtek SDK MiniIGD 命令注入",
      "desc": "UPnP SOAP 远程命令执行，大量路由器受影响"},
+    # —— 加密库 ——
     {"pattern": r"OpenSSL\s+1\.0\.1[a-g]?[\s/]", "cve": "CVE-2014-0160",
      "severity": "high", "name": "Heartbleed",
      "desc": "1.0.1～1.0.1g 内存越界读取，可泄露密钥"},
+    {"pattern": r"OpenSSL\s+1\.0\.1[a-f]?[\s/]", "cve": "CVE-2014-0224",
+     "severity": "high", "name": "OpenSSL CCS 注入",
+     "desc": "1.0.1g 之前的 CCS 注入可被降级为中间人"},
+    # —— SSH ——
+    {"pattern": r"OpenSSH_(5\.[4-9]|6\.|7\.[01])(?!\d)", "cve": "CVE-2016-0777",
+     "severity": "medium", "name": "OpenSSH roaming 信息泄露",
+     "desc": "5.4～7.1 的 roaming 代码可泄露进程内存"},
+    {"pattern": r"OpenSSH_(8\.|9\.[0-5])(?!\d)", "cve": "CVE-2023-48795",
+     "severity": "medium", "name": "Terrapin 握手前缀截断",
+     "desc": "9.6 之前版本的 SSH 握手前缀截断攻击"},
+    # —— 设备家族 ——
+    {"pattern": r"App-webs", "cve": "CVE-2017-7921",
+     "severity": "high", "name": "海康威视未授权访问（家族）",
+     "desc": "App-webs 服务端的海康设备家族存在未授权访问，具体固件版本需核实"},
+    {"pattern": r"DS-2(CD|DE|CV|DF)", "cve": "CVE-2017-7921",
+     "severity": "medium", "name": "海康威视摄像头（家族）",
+     "desc": "该型号家族多个固件受未授权访问影响，具体版本需核实"},
+    {"pattern": r"IIS/6\.0", "cve": "CVE-2017-7269",
+     "severity": "high", "name": "IIS 6.0 WebDAV 缓冲区溢出",
+     "desc": "Windows 2003 的 IIS 6.0 WebDAV 远程代码执行"},
+    # —— 停止维护 ——
     {"pattern": r"Boa/0\.9", "cve": "",
      "severity": "medium", "name": "Boa 停止维护",
      "desc": "嵌入式 Web 服务器早已停止维护，路由器/摄像头固件常见，历史问题多"},
+    {"pattern": r"mini_httpd", "cve": "",
+     "severity": "medium", "name": "mini_httpd 停止维护",
+     "desc": "嵌入式 Web 服务器长期无维护，常见于路由器固件"},
     {"pattern": r"PHP/5\.", "cve": "",
      "severity": "low", "name": "PHP 5.x（EOL）",
+     "desc": "已停止安全维护的分支"},
+    {"pattern": r"PHP/7\.[0-3]\.", "cve": "",
+     "severity": "low", "name": "PHP 7.0～7.3（EOL）",
      "desc": "已停止安全维护的分支"},
     {"pattern": r"Apache/2\.2\.", "cve": "",
      "severity": "low", "name": "Apache 2.2（EOL）",
      "desc": "已停止安全维护的分支"},
+    {"pattern": r"nginx/0\.|nginx/1\.[0-9]\.", "cve": "",
+     "severity": "low", "name": "nginx 旧版本（EOL）",
+     "desc": "1.9 及更早分支早已停止维护"},
+    {"pattern": r"lighttpd/1\.4\.[0-2]\d", "cve": "",
+     "severity": "low", "name": "lighttpd 旧版本",
+     "desc": "1.4.2x 及更早版本年代久远，建议核实版本"},
 ]
 
 
-def match_vulns(port_infos: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """对全部端口的 banner/Server 串做签名匹配，按 (cve, name, port) 去重。"""
+def match_vulns(
+    port_infos: List[Dict[str, Any]], snmp: Optional[Dict[str, str]] = None
+) -> List[Dict[str, Any]]:
+    """对端口指纹（banner/Server/X-Powered-By/产品版本）与 SNMP sysDescr
+    做签名匹配，按 (cve, name, port) 去重；port=0 表示设备级（SNMP）。"""
     vulns: List[Dict[str, Any]] = []
     seen = set()
-    for p in port_infos:
-        http = p.get("http") or {}
-        haystack = f"{p.get('banner', '')} {http.get('server', '')}"
+
+    def check(haystack: str, port: int) -> None:
         for sig in VULN_SIGNATURES:
             if re.search(sig["pattern"], haystack, re.I):
-                key = (sig["cve"], sig["name"], p["port"])
+                key = (sig["cve"], sig["name"], port)
                 if key in seen:
                     continue
                 seen.add(key)
                 vulns.append({
                     "cve": sig["cve"], "name": sig["name"],
                     "severity": sig["severity"], "desc": sig["desc"],
-                    "port": p["port"], "evidence": haystack.strip()[:120],
+                    "port": port, "evidence": haystack.strip()[:120],
                 })
+
+    for p in port_infos:
+        http = p.get("http") or {}
+        haystack = " ".join(filter(None, [
+            p.get("banner", ""),
+            http.get("server", ""),
+            http.get("x_powered_by", ""),
+            p.get("product", ""),
+            p.get("version", ""),
+            p.get("extrainfo", ""),
+        ]))
+        if haystack.strip():
+            check(haystack, p["port"])
+    if snmp:
+        dev_hay = " ".join(filter(None, [
+            snmp.get("sysDescr", ""), snmp.get("sysName", ""),
+        ]))
+        if dev_hay.strip():
+            check(dev_hay, 0)
     order = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     vulns.sort(key=lambda v: order.get(v["severity"], 9))
     return vulns
@@ -405,24 +782,46 @@ class ReconRunner:
             ports = full_port_scan(ip)
             self.status["stage"] = "服务指纹"
             port_infos = fingerprint_all(ip, ports)
+            self.status["stage"] = "SNMP 探测"
+            snmp = snmp_probe(ip)
+            nmap_res = None
+            if _nmap_available():
+                self.status["stage"] = "nmap 版本识别"
+                nmap_res = nmap_version_scan(ip, ports)
+            if nmap_res:
+                for info in port_infos:
+                    nm = nmap_res["ports"].get(info["port"])
+                    if not nm:
+                        continue
+                    if nm["service"] and not info["service"]:
+                        info["service"] = nm["service"]
+                    info["product"] = nm["product"] or info.get("product", "")
+                    info["version"] = nm["version"] or info.get("version", "")
+                    info["extrainfo"] = nm["extrainfo"] or info.get("extrainfo", "")
             self.status["stage"] = "OS 识别"
             osinfo = os_fingerprint(ip)
+            if nmap_res and nmap_res.get("os"):
+                osinfo["nmap"] = nmap_res["os"]
+                if osinfo.get("guess") in ("", "unknown"):
+                    osinfo["guess"] = nmap_res["os"]
             self.status["stage"] = "风险评估"
             findings = assess_risks(port_infos, osinfo)
-            vulns = match_vulns(port_infos)
+            vulns = match_vulns(port_infos, snmp)
             dev = self.store.get_device(mac) or {}
             report = {
-                "version": 1,
+                "version": 2,
                 "ts": time.time(),
                 "duration": round(time.time() - t0, 1),
                 "mac": mac,
                 "ip": ip,
+                "engine": "nmap" if nmap_res else "builtin",
                 "device": {
                     "name": dev.get("custom_name") or dev.get("hostname") or "",
                     "vendor": dev.get("vendor") or "",
                     "type": dev.get("custom_type") or dev.get("device_type") or "unknown",
                 },
                 "os": osinfo,
+                "snmp": snmp,
                 "open_count": len(ports),
                 "ports": port_infos,
                 "findings": findings,

@@ -406,19 +406,33 @@ function renderReconReport() {
     `<div class="recon-row">${sevChip(f.severity)}<span class="recon-msg">${esc(f.message)}` +
     `${f.ports && f.ports.length ? `<span class="recon-ports">（端口 ${f.ports.join(",")}）</span>` : ""}</span></div>`
   ).join("");
-  const vulnsHtml = (r.vulns || []).map((v) =>
-    `<div class="recon-row">${sevChip(v.severity)}<span class="recon-msg"><b>${v.cve ? esc(v.cve) + " " : ""}${esc(v.name)}</b>` +
-    `——端口 ${v.port}｜${esc(v.desc)}<div class="recon-evidence">证据：${esc(v.evidence)}</div></span></div>`
-  ).join("");
-  const portsShown = (r.ports || []).slice(0, 30).map((p) =>
-    `<span class="port-chip">${p.port}${p.service ? "(" + esc(p.service) + ")" : ""}</span>`
-  ).join("");
+  const vulnsHtml = (r.vulns || []).map((v) => {
+    const where = v.port === 0 ? "设备级" : `端口 ${v.port}`;
+    return `<div class="recon-row">${sevChip(v.severity)}<span class="recon-msg"><b>${v.cve ? esc(v.cve) + " " : ""}${esc(v.name)}</b>` +
+      `——${where}｜${esc(v.desc)}<div class="recon-evidence">证据：${esc(v.evidence)}</div></span></div>`;
+  }).join("");
+  const portsShown = (r.ports || []).slice(0, 30).map((p) => {
+    let label = String(p.port);
+    let extra = p.service || "";
+    if (p.product) {
+      extra += (extra ? " " : "") + p.product + (p.version ? " " + p.version : "");
+    }
+    if (extra) label += `(${extra.trim()})`;
+    return `<span class="port-chip" title="${esc((p.banner || "") + " " + (p.extrainfo || ""))}">${esc(label)}</span>`;
+  }).join("");
   const os = r.os || {};
+  const snmp = r.snmp || {};
+  const snmpHtml = (snmp.sysDescr || snmp.sysName)
+    ? `<div class="recon-sub">SNMP</div><div class="recon-meta">sysName：${esc(snmp.sysName || "—")}｜sysDescr：${esc((snmp.sysDescr || "").slice(0, 100))}</div>`
+    : "";
+  const engineLabel = r.engine === "nmap" ? "nmap" : "内置探针";
   setHtml(box,
-    `<div class="recon-meta">${fmtDateTime(r.ts)}｜耗时 ${r.duration} 秒｜开放 ${r.open_count} 端口｜OS 猜测：${esc(os.guess || "未知")}` +
+    `<div class="recon-meta">${fmtDateTime(r.ts)}｜耗时 ${r.duration} 秒｜开放 ${r.open_count} 端口｜引擎：${engineLabel}｜OS 猜测：${esc(os.guess || "未知")}` +
+    `${os.nmap ? `｜nmap：${esc(os.nmap)}` : ""}` +
     `${r.skipped_ports && r.skipped_ports.length ? `｜跳过 ${r.skipped_ports.join(",")}（本机劫持端口）` : ""}</div>` +
     (findingsHtml ? `<div class="recon-sub">风险发现</div>${findingsHtml}` : "") +
     (vulnsHtml ? `<div class="recon-sub">漏洞签名命中</div>${vulnsHtml}` : "") +
+    snmpHtml +
     (portsShown ? `<div class="recon-sub">开放端口</div><div class="dc-ports">${portsShown}</div>` : "") +
     `<div class="recon-kali">Kali 衔接：<code>${esc(r.kali_hint || "")}</code></div>` +
     `<a class="btn btn-ghost recon-export" href="/api/devices/${encodeURIComponent(r.mac)}/recon/export">导出报告 JSON</a>`);

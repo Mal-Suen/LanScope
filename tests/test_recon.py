@@ -8,12 +8,40 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from lanscope.recon import (
     ReconRunner,
+    _ber_parse,
+    _ber_tlv,
+    _nmap_parse_xml,
+    _oid_encode,
     _service_from_banner,
+    _snmp_get_request,
+    _snmp_parse_response,
+    _SYSDESCR_OID,
+    _SYSNAME_OID,
     assess_risks,
     match_vulns,
     nmap_hint,
 )
 from lanscope.store import Store
+
+
+def _make_snmp_response(sysdescr: bytes, sysname: bytes) -> bytes:
+    """构造 v2c GET 响应夹具（GetResponse PDU＝0xA2）。"""
+
+    def vb(oid: bytes, value: bytes) -> bytes:
+        return _ber_tlv(0x30, _ber_tlv(0x06, oid) + _ber_tlv(0x04, value))
+
+    varbinds = (
+        vb(_oid_encode(_SYSDESCR_OID), sysdescr)
+        + vb(_oid_encode(_SYSNAME_OID), sysname)
+    )
+    pdu = (
+        _ber_tlv(0x02, b"\x01")
+        + _ber_tlv(0x02, b"\x00")
+        + _ber_tlv(0x02, b"\x00")
+        + _ber_tlv(0x30, varbinds)
+    )
+    msg = _ber_tlv(0x02, b"\x01") + _ber_tlv(0x04, b"public") + _ber_tlv(0xA2, pdu)
+    return _ber_tlv(0x30, msg)
 
 
 def _port_info(port, service="", banner="", http=None):
@@ -105,6 +133,89 @@ class TestNmapHint(unittest.TestCase):
     def test_hint_empty_ports_full_range(self):
         hint = nmap_hint("192.168.1.1", [])
         self.assertIn("1-65535", hint)
+
+
+class TestSnmpCodec(unittest.TestCase):
+    def test_oid_encode(self):
+        self.assertEqual(
+            _oid_encode("1.3.6.1.2.1.1.1.0"),
+            b"\x2b\x06\x01\x02\x01\x01\x01\x00",
+        )
+
+    def test_get_request_parsable(self):
+        pkt = _snmp_get_request(["1.3.6.1.2.1.1.1.0"], "public")
+        parsed = _ber_parse(pkt)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed[0], 0x30)  # 顶层 SEQUENCE
+
+    def test_parse_response(self):
+        resp = _make_snmp_response(b"Linux XiaoQiang 2.6.36", b"XiaoQiang")
+        out = _snmp_parse_response(resp)
+        self.assertEqual(out["sysDescr"], "Linux XiaoQiang 2.6.36")
+        self.assertEqual(out["sysName"], "XiaoQiang")
+
+    def test_parse_garbage_returns_empty(self):
+        self.assertEqual(_snmp_parse_response(b"\x00\x01zz"), {})
+
+
+_NMAP_XML = """<?xml version="1.0"?>
+<nmaprun>
+<host>
+<ports>
+<port protocol="tcp" portid="80"><state state="open"/><service name="http" product="lighttpd" version="1.4.35" extrainfo="Xiaomi"/></port>
+<port protocol="tcp" portid="22"><state state="open"/><service name="ssh" product="dropbear" version="2019.78"/></port>
+</ports>
+<os><osmatch name="Linux 2.6.32 - 2.6.39" accuracy="98"/></os>
+</host>
+</nmaprun>"""
+
+
+class TestNmapParse(unittest.TestCase):
+    def test_parse_xml(self):
+        result = _nmap_parse_xml(_NMAP_XML)
+        self.assertEqual(result["ports"][80]["product"], "lighttpd")
+        self.assertEqual(result["ports"][80]["version"], "1.4.35")
+        self.assertEqual(result["ports"][80]["extrainfo"], "Xiaomi")
+        self.assertEqual(result["ports"][22]["service"], "ssh")
+        self.assertEqual(result["os"], "Linux 2.6.32 - 2.6.39")
+
+
+class TestNewVulnSignatures(unittest.TestCase):
+    def test_apache_2450_traversal(self):
+        vulns = match_vulns(
+            [_port_info(80, "http", http={"server": "Apache/2.4.50 (Unix)"})]
+        )
+        self.assertTrue(any(v["cve"] == "CVE-2021-42013" for v in vulns))
+
+    def test_proftpd_mod_copy_version_gate(self):
+        hit = match_vulns([_port_info(21, "ftp", banner="ProFTPD 1.3.5 Server")])
+        self.assertTrue(any(v["cve"] == "CVE-2015-3306" for v in hit))
+        miss = match_vulns([_port_info(21, "ftp", banner="ProFTPD 1.3.6 Server")])
+        self.assertEqual(miss, [])
+
+    def test_thinkphp_x_powered_by(self):
+        vulns = match_vulns(
+            [_port_info(8080, "http", http={"x_powered_by": "ThinkPHP 5.1.39LTS"})]
+        )
+        self.assertTrue(any("ThinkPHP" in v["name"] for v in vulns))
+
+    def test_terrapin_version_gate(self):
+        hit = match_vulns([_port_info(22, "ssh", banner="SSH-2.0-OpenSSH_9.5")])
+        self.assertTrue(any(v["cve"] == "CVE-2023-48795" for v in hit))
+        miss = match_vulns([_port_info(22, "ssh", banner="SSH-2.0-OpenSSH_9.6p1")])
+        self.assertFalse(any(v["cve"] == "CVE-2023-48795" for v in miss))
+
+    def test_hikvision_appwebs(self):
+        vulns = match_vulns([_port_info(80, "http", http={"server": "App-webs/"})])
+        self.assertTrue(any(v["cve"] == "CVE-2017-7921" for v in vulns))
+
+    def test_snmp_device_level_match(self):
+        vulns = match_vulns(
+            [], snmp={"sysDescr": "DS-2CD2143G0-IW V5.3.0", "sysName": "Camera"}
+        )
+        self.assertEqual(len(vulns), 1)
+        self.assertEqual(vulns[0]["port"], 0)
+        self.assertTrue(vulns[0]["name"].startswith("海康"))
 
 
 class TestReconStoreAndRunner(unittest.TestCase):
