@@ -66,6 +66,7 @@
         <div class="form-row"><label>巡检间隔（秒）</label><input id="sInterval" type="number" min="60" step="30"></div>
         <div class="form-row"><label>端口扫描</label><input id="sPorts" type="checkbox" class="switch"></div>
         <div class="form-row"><label>被动嗅探（重启控制台后生效）</label><input id="sSniffer" type="checkbox" class="switch"></div>
+        <div class="form-row"><label>陌生设备自动深度侦察</label><input id="sReconAuto" type="checkbox" class="switch"></div>
         <div class="form-row"><label>告警系统弹窗</label><input id="sToast" type="checkbox" class="switch"></div>
         <button id="btnSaveSettings" class="btn btn-primary">保存设置</button>
       </div>
@@ -108,6 +109,12 @@
       <button id="btnSaveDevice" class="btn btn-primary">保存</button>
     </div>
     <div class="drawer-section"><h4>开放端口与服务</h4><div id="drawerPorts"></div></div>
+    <div class="drawer-section">
+      <h4>深度侦察</h4>
+      <div id="reconStatus" class="muted small-text"></div>
+      <button id="btnRecon" class="btn btn-ghost">开始深度侦察（全端口＋指纹＋风险）</button>
+      <div id="reconReport"></div>
+    </div>
     <div class="drawer-section"><h4>近 24 小时在线时段</h4><div id="drawerTimeline" class="timeline"></div></div>
     <div class="drawer-section"><h4>相关事件</h4><div id="drawerEvents" class="event-list small"></div></div>
   </div>

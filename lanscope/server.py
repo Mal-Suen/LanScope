@@ -18,6 +18,7 @@ from .arpwatch import ArpWatch
 from .fingerprint import ensure_oui, oui_status, refresh_oui
 from .netinfo import detect_env
 from .patrol import Patrol
+from .recon import ReconRunner
 from .store import Store
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
@@ -76,7 +77,10 @@ class LanScopeApp:
     def __init__(self, db_path=None, port: int = 8765, open_browser: bool = True):
         self.store = Store(db_path)
         self.env = detect_env()
-        self.patrol = Patrol(self.store, self.env)
+        self.recon = ReconRunner(self.store)
+        self.patrol = Patrol(
+            self.store, self.env, on_new_device=self.recon.auto_trigger
+        )
         self.arpwatch = ArpWatch(
             self.env,
             on_observation=self.patrol._observe,
@@ -135,6 +139,7 @@ class LanScopeApp:
                 "last_run": self.store.last_run(),
                 "interval": interval,
             },
+            "recon": dict(self.recon.status),
             "stats": self.store.stats(),
             "devices": devices,
             "events": self.store.list_events(60),
@@ -167,6 +172,23 @@ class LanScopeApp:
             self.patrol.run_full_scan(trigger)
         except Exception:
             pass
+
+    # ---------- 深度侦察 ----------
+
+    def start_recon(self, mac: str) -> Dict[str, Any]:
+        mac = (mac or "").upper()
+        dev = self.store.get_device(mac)
+        if not dev:
+            return {"started": False, "reason": "设备不存在"}
+        ip = dev.get("last_ip") or ""
+        if not ip:
+            return {"started": False, "reason": "该设备没有 IP 记录"}
+        if self.recon.is_running():
+            return {"started": False, "reason": "已有侦察任务进行中，请稍候"}
+        return {"started": self.recon.start(mac, ip)}
+
+    def latest_recon_report(self, mac: str) -> Dict[str, Any]:
+        return {"report": self.store.latest_recon((mac or "").upper())}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -219,7 +241,20 @@ class Handler(BaseHTTPRequestHandler):
         except Exception:
             return {}
 
-    # ---------- 路由 ----------
+    def _export_recon(self, mac: str) -> None:
+        report = self.app.store.latest_recon((mac or "").upper())
+        if not report:
+            self._json({"error": "暂无侦察报告"}, 404)
+            return
+        body = json.dumps(report, ensure_ascii=False, indent=2).encode("utf-8")
+        filename = f"lanscope-recon-{(mac or '').replace(':', '')}.json"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
@@ -239,7 +274,20 @@ class Handler(BaseHTTPRequestHandler):
                     {"devices": [_device_payload(d) for d in app.store.list_devices()]}
                 )
             elif path.startswith("/api/devices/"):
-                self._json(app.device_detail(unquote(path.split("/")[3])))
+                parts = [p for p in path.split("/") if p]
+                mac = unquote(parts[2]) if len(parts) > 2 else ""
+                action = parts[3] if len(parts) > 3 else ""
+                if action == "recon":
+                    if len(parts) > 4 and parts[4] == "export":
+                        self._export_recon(mac)
+                    else:
+                        self._json(app.latest_recon_report(mac))
+                elif not action:
+                    self._json(app.device_detail(mac))
+                else:
+                    self._json({"error": "not found"}, 404)
+            elif path == "/api/recon/status":
+                self._json(app.recon.status)
             elif path == "/api/events":
                 qs = parse_qs(parsed.query)
                 limit = min(500, max(1, int(qs.get("limit", ["100"])[0])))
@@ -263,6 +311,15 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(result, 200 if result.get("started") else 409)
             elif path == "/api/devices/mark-all-known":
                 self._json({"marked": app.store.mark_all_known()})
+            elif path.startswith("/api/devices/"):
+                parts = [p for p in path.split("/") if p]
+                mac = unquote(parts[2]) if len(parts) > 2 else ""
+                action = parts[3] if len(parts) > 3 else ""
+                if action == "recon":
+                    result = app.start_recon(mac)
+                    self._json(result, 200 if result.get("started") else 409)
+                else:
+                    self._json({"error": "not found"}, 404)
             elif path == "/api/events/read-all":
                 app.store.mark_events_read()
                 self._json({"ok": True})

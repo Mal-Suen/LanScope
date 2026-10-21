@@ -15,6 +15,7 @@ DEFAULT_SETTINGS: Dict[str, str] = {
     "port_scan": "1",
     "sniffer": "1",
     "toast_critical": "1",
+    "recon_auto": "0",
 }
 
 _SCHEMA = """
@@ -67,6 +68,13 @@ CREATE TABLE IF NOT EXISTS port_snapshots(
     ts REAL NOT NULL,
     ports TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS recon_reports(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mac TEXT NOT NULL,
+    ts REAL NOT NULL,
+    report TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_recon_mac ON recon_reports(mac, id);
 CREATE TABLE IF NOT EXISTS settings(
     key TEXT PRIMARY KEY,
     value TEXT
@@ -323,6 +331,26 @@ class Store:
                 "UPDATE devices SET services=? WHERE mac=?", (payload, mac)
             )
             self._conn.commit()
+
+    # ---------- 深度侦察 ----------
+
+    def save_recon(self, mac: str, report: Dict[str, Any]) -> None:
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO recon_reports(mac, ts, report) VALUES(?,?,?)",
+                (mac, report.get("ts", time.time()),
+                 json.dumps(report, ensure_ascii=False)),
+            )
+            self._conn.commit()
+
+    def latest_recon(self, mac: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT report FROM recon_reports WHERE mac=? "
+                "ORDER BY id DESC LIMIT 1",
+                (mac,),
+            ).fetchone()
+        return json.loads(row["report"]) if row else None
 
     # ---------- 统计 ----------
 

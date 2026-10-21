@@ -26,9 +26,10 @@ from .store import Store
 
 
 class Patrol:
-    def __init__(self, store: Store, env: NetEnv):
+    def __init__(self, store: Store, env: NetEnv, on_new_device=None):
         self.store = store
         self.env = env
+        self.on_new_device = on_new_device  # 新设备事件回调 (mac, ip)——自动侦察等挂这里
         self.scanning = False
         self.last_scan: Optional[Dict] = None
         self._stop = threading.Event()
@@ -102,6 +103,11 @@ class Patrol:
                         ts,
                     )
                     self._notify(f"LanScope：发现新设备 {name}（{ip}）")
+                    if self.on_new_device:
+                        try:
+                            self.on_new_device(mac, ip)
+                        except Exception:
+                            pass
                 return
             was_online = existing["status"] == 1
             old_ip = existing["last_ip"]

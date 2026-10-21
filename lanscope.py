@@ -2,8 +2,9 @@
 """LanScope —— 局域网设备管家。
 
 用法：
-  python lanscope.py scan [--json]              一次性扫描全网段并输出结果
+  python lanscope.py scan [--json]                     一次性扫描全网段并输出结果
   python lanscope.py serve [--port N] [--no-browser]   启动 Web 控制台（默认）
+  python lanscope.py recon <MAC|IP>                    对单台设备深度侦察
 """
 from __future__ import annotations
 
@@ -103,6 +104,71 @@ def _print_table(store, devices, result) -> None:
         )
 
 
+def cmd_recon(args) -> int:
+    from lanscope.recon import ReconRunner
+    from lanscope.store import Store
+
+    store = Store(args.db)
+    target = (args.target or "").strip()
+    mac = target.upper() if ":" in target else ""
+    if not mac:
+        for d in store.list_devices():
+            if d["last_ip"] == target:
+                mac = d["mac"]
+                break
+    if not mac or not store.device_exists(mac):
+        print(f"错误：{target} 不在设备台账中（先跑一次 scan）。")
+        store.close()
+        return 1
+    ip = store.get_device(mac)["last_ip"]
+    print(f"目标：{mac}（{ip}）——全端口扫描约 10～120 秒…")
+    runner = ReconRunner(store)
+    report = runner.run(mac, ip)
+    if report is None:
+        print("侦察未能完成（可能已有侦察任务在跑）。")
+        store.close()
+        return 1
+    _print_recon(report)
+    store.close()
+    return 0
+
+
+def _print_recon(report) -> None:
+    print(f"\n深度侦察报告：{report['ip']}（{report['mac']}）")
+    skipped = ",".join(map(str, report.get("skipped_ports", [])))
+    print(
+        f"耗时 {report['duration']} 秒｜开放端口 {report['open_count']} 个"
+        f"｜跳过端口 {skipped}（本机安全软件劫持，防假阳性）"
+    )
+    osinfo = report.get("os") or {}
+    print(f"OS 猜测：{osinfo.get('guess') or '未知'}（{osinfo.get('basis') or '—'}）")
+    findings = report.get("findings") or []
+    if findings:
+        print("\n风险发现：")
+        for f in findings:
+            ports = (
+                f"（端口 {','.join(map(str, f['ports']))}）" if f.get("ports") else ""
+            )
+            print(f"  [{f['severity']}] {f['message']}{ports}")
+    vulns = report.get("vulns") or []
+    if vulns:
+        print("\n漏洞签名命中：")
+        for v in vulns:
+            cve = f"{v['cve']} " if v.get("cve") else ""
+            print(
+                f"  [{v['severity']}] {cve}{v['name']}"
+                f"——端口 {v['port']}｜证据：{v['evidence']}"
+            )
+    ports = report.get("ports") or []
+    if ports:
+        shown = ", ".join(
+            str(p["port"]) + (f"({p['service']})" if p.get("service") else "")
+            for p in ports[:40]
+        )
+        print(f"\n开放端口：{shown}")
+    print(f"\nKali 衔接：{report.get('kali_hint', '')}")
+
+
 def cmd_serve(args) -> int:
     from lanscope.server import LanScopeApp, run_server
 
@@ -124,6 +190,10 @@ def main() -> int:
     p_scan.add_argument("--json", action="store_true", help="以 JSON 输出")
     p_scan.add_argument("--db", default=None, help="数据库路径（默认 data/lanscope.db）")
 
+    p_recon = sub.add_parser("recon", help="对单台设备深度侦察（全端口＋指纹＋风险）")
+    p_recon.add_argument("target", help="设备 MAC 或 IP（须已在台账中）")
+    p_recon.add_argument("--db", default=None, help="数据库路径（默认 data/lanscope.db）")
+
     p_serve = sub.add_parser("serve", help="启动 Web 控制台")
     p_serve.add_argument("--port", type=int, default=8765, help="监听端口（默认 8765）")
     p_serve.add_argument("--no-browser", action="store_true", help="不自动打开浏览器")
@@ -132,6 +202,8 @@ def main() -> int:
     args = parser.parse_args()
     if args.cmd == "scan":
         return cmd_scan(args)
+    if args.cmd == "recon":
+        return cmd_recon(args)
     if args.cmd is None:
         args = p_serve.parse_args([])
     return cmd_serve(args)

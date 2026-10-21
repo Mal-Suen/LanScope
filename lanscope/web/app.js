@@ -37,6 +37,8 @@ let drawerData = null;
 let lastEventId = 0;
 let polling = false;
 let eventFilter = "all";
+let reconReport = null;
+let reconPolling = false;
 
 /* ---------- 工具 ---------- */
 
@@ -258,6 +260,7 @@ function renderSettings() {
   safeSetInput($("#sPorts"), s.port_scan === "1");
   safeSetInput($("#sSniffer"), s.sniffer === "1");
   safeSetInput($("#sToast"), s.toast_critical === "1");
+  safeSetInput($("#sReconAuto"), s.recon_auto === "1");
 
   const oui = state.oui;
   const src = oui.source === "ieee" ? "IEEE 全量库" : "内置精简库（尚未联网更新）";
@@ -277,13 +280,18 @@ function renderSettings() {
 async function openDrawer(mac) {
   drawerMac = mac;
   try {
-    const res = await fetch("/api/devices/" + encodeURIComponent(mac));
+    const [res, resRecon] = await Promise.all([
+      fetch("/api/devices/" + encodeURIComponent(mac)),
+      fetch("/api/devices/" + encodeURIComponent(mac) + "/recon"),
+    ]);
     const data = await res.json();
     if (data.error) {
       toast(data.error, "warn");
       return;
     }
     drawerData = data;
+    const rd = await resRecon.json();
+    reconReport = rd.report || null;
   } catch (e) {
     return;
   }
@@ -341,6 +349,8 @@ function renderDrawer() {
   const evs = drawerData.events || [];
   setHtml($("#drawerEvents"),
     evs.map((ev) => eventRowHtml(ev, true)).join("") || '<div class="empty-mini">暂无事件</div>');
+
+  renderReconSection();
 }
 
 function renderTimeline(presences) {
@@ -366,6 +376,97 @@ function renderTimeline(presences) {
   setHtml($("#drawerTimeline"),
     `<div class="tl-track">${segHtml || '<div class="tl-empty">近 24 小时无在线记录</div>'}</div>` +
     `<div class="tl-ticks"><span>24h 前</span><span>18h</span><span>12h</span><span>6h</span><span>现在</span></div>`);
+}
+
+/* ---------- 深度侦察 ---------- */
+
+const SEV_LABELS = { critical: "严重", high: "高危", medium: "中危", low: "低危", info: "提示" };
+
+function renderReconSection() {
+  const btn = $("#btnRecon");
+  const running = !!(state && state.recon && state.recon.running);
+  btn.disabled = running;
+  btn.textContent = running ? "侦察进行中…" : "开始深度侦察（全端口＋指纹＋风险）";
+  const st = state && state.recon ? state.recon : null;
+  setHtml($("#reconStatus"),
+    running && st ? `正在侦察 ${esc(st.mac || "")}：${esc(st.stage || "")}` : "");
+  renderReconReport();
+  if (running) pollRecon();
+}
+
+function renderReconReport() {
+  const box = $("#reconReport");
+  if (!reconReport) {
+    setHtml(box, '<div class="empty-mini">尚未做过深度侦察。全端口扫描约 10～120 秒，期间会向该设备发送探测流量。</div>');
+    return;
+  }
+  const r = reconReport;
+  const sevChip = (s) => `<span class="chip sev-chip-${s}">${SEV_LABELS[s] || esc(s)}</span>`;
+  const findingsHtml = (r.findings || []).map((f) =>
+    `<div class="recon-row">${sevChip(f.severity)}<span class="recon-msg">${esc(f.message)}` +
+    `${f.ports && f.ports.length ? `<span class="recon-ports">（端口 ${f.ports.join(",")}）</span>` : ""}</span></div>`
+  ).join("");
+  const vulnsHtml = (r.vulns || []).map((v) =>
+    `<div class="recon-row">${sevChip(v.severity)}<span class="recon-msg"><b>${v.cve ? esc(v.cve) + " " : ""}${esc(v.name)}</b>` +
+    `——端口 ${v.port}｜${esc(v.desc)}<div class="recon-evidence">证据：${esc(v.evidence)}</div></span></div>`
+  ).join("");
+  const portsShown = (r.ports || []).slice(0, 30).map((p) =>
+    `<span class="port-chip">${p.port}${p.service ? "(" + esc(p.service) + ")" : ""}</span>`
+  ).join("");
+  const os = r.os || {};
+  setHtml(box,
+    `<div class="recon-meta">${fmtDateTime(r.ts)}｜耗时 ${r.duration} 秒｜开放 ${r.open_count} 端口｜OS 猜测：${esc(os.guess || "未知")}` +
+    `${r.skipped_ports && r.skipped_ports.length ? `｜跳过 ${r.skipped_ports.join(",")}（本机劫持端口）` : ""}</div>` +
+    (findingsHtml ? `<div class="recon-sub">风险发现</div>${findingsHtml}` : "") +
+    (vulnsHtml ? `<div class="recon-sub">漏洞签名命中</div>${vulnsHtml}` : "") +
+    (portsShown ? `<div class="recon-sub">开放端口</div><div class="dc-ports">${portsShown}</div>` : "") +
+    `<div class="recon-kali">Kali 衔接：<code>${esc(r.kali_hint || "")}</code></div>` +
+    `<a class="btn btn-ghost recon-export" href="/api/devices/${encodeURIComponent(r.mac)}/recon/export">导出报告 JSON</a>`);
+}
+
+async function startRecon() {
+  if (!drawerMac) return;
+  const r = await api("/api/devices/" + encodeURIComponent(drawerMac) + "/recon");
+  if (!r.started) {
+    toast(r.reason || "无法启动侦察", "warn");
+    return;
+  }
+  toast("深度侦察已启动（约 10～120 秒）", "info");
+  pollRecon();
+}
+
+async function pollRecon() {
+  if (reconPolling) return;
+  reconPolling = true;
+  try {
+    while (drawerMac) {
+      const res = await fetch("/api/recon/status", { cache: "no-store" });
+      const st = await res.json();
+      const btn = $("#btnRecon");
+      btn.disabled = !!st.running;
+      btn.textContent = st.running ? "侦察进行中…" : "开始深度侦察（全端口＋指纹＋风险）";
+      setHtml($("#reconStatus"),
+        st.running ? `正在侦察 ${esc(st.mac || "")}：${esc(st.stage || "")}` : "");
+      if (!st.running) break;
+      await new Promise((ok) => setTimeout(ok, 2500));
+    }
+  } catch (e) {
+    /* 状态暂不可达，交回主轮询 */
+  }
+  reconPolling = false;
+  if (drawerMac) await refreshReconReport();
+}
+
+async function refreshReconReport() {
+  if (!drawerMac) return;
+  try {
+    const res = await fetch("/api/devices/" + encodeURIComponent(drawerMac) + "/recon");
+    const data = await res.json();
+    reconReport = data.report || null;
+  } catch (e) {
+    return;
+  }
+  renderReconReport();
 }
 
 /* ---------- 操作 ---------- */
@@ -412,6 +513,7 @@ async function saveSettings() {
     port_scan: $("#sPorts").checked ? "1" : "0",
     sniffer: $("#sSniffer").checked ? "1" : "0",
     toast_critical: $("#sToast").checked ? "1" : "0",
+    recon_auto: $("#sReconAuto").checked ? "1" : "0",
   };
   await api("/api/settings", "POST", body);
   toast("设置已保存", "info");
@@ -448,6 +550,7 @@ function init() {
   $("#btnOuiRefresh").addEventListener("click", refreshOui);
   $("#btnMarkAll").addEventListener("click", markAllKnown);
   $("#btnSaveDevice").addEventListener("click", saveDevice);
+  $("#btnRecon").addEventListener("click", startRecon);
   $("#btnCloseDrawer").addEventListener("click", closeDrawer);
   $("#drawerMask").addEventListener("click", closeDrawer);
   document.addEventListener("keydown", (e) => {
