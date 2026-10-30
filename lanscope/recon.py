@@ -662,12 +662,12 @@ VULN_SIGNATURES = [
      "severity": "high", "name": "Realtek SDK MiniIGD 命令注入",
      "desc": "UPnP SOAP 远程命令执行，大量路由器受影响"},
     # —— 加密库 ——
-    {"pattern": r"OpenSSL\s+1\.0\.1[a-g]?[\s/]", "cve": "CVE-2014-0160",
+    {"pattern": r"OpenSSL\s+1\.0\.1[a-f]?[\s/]", "cve": "CVE-2014-0160",
      "severity": "high", "name": "Heartbleed",
-     "desc": "1.0.1～1.0.1g 内存越界读取，可泄露密钥"},
-    {"pattern": r"OpenSSL\s+1\.0\.1[a-f]?[\s/]", "cve": "CVE-2014-0224",
+     "desc": "1.0.1～1.0.1f 内存越界读取，可泄露密钥（1.0.1g 已修复）"},
+    {"pattern": r"OpenSSL\s+1\.0\.1[a-g]?[\s/]", "cve": "CVE-2014-0224",
      "severity": "high", "name": "OpenSSL CCS 注入",
-     "desc": "1.0.1g 之前的 CCS 注入可被降级为中间人"},
+     "desc": "1.0.1h 之前的 CCS 注入可被降级为中间人"},
     # —— SSH ——
     {"pattern": r"OpenSSH_(5\.[4-9]|6\.|7\.[01])(?!\d)", "cve": "CVE-2016-0777",
      "severity": "medium", "name": "OpenSSH roaming 信息泄露",
@@ -773,9 +773,13 @@ class ReconRunner:
         return bool(self.status.get("running"))
 
     def run(self, mac: str, ip: str) -> Optional[Dict[str, Any]]:
-        """同步执行完整侦察流程（由线程调用），返回报告。"""
+        """同步执行完整侦察流程（CLI 调用），返回报告。"""
         if not self._lock.acquire(blocking=False):
             return None
+        return self._execute(mac, ip)
+
+    def _execute(self, mac: str, ip: str) -> Optional[Dict[str, Any]]:
+        """在已持有锁的前提下执行完整侦察流程，结束时释放锁。"""
         t0 = time.time()
         self.status = {"running": True, "mac": mac, "stage": "全端口扫描", "started": t0}
         try:
@@ -843,18 +847,27 @@ class ReconRunner:
 
     def _safe_run(self, mac: str, ip: str) -> None:
         try:
-            self.run(mac, ip)
+            self._execute(mac, ip)
         except Exception:
             pass
 
     def start(self, mac: str, ip: str) -> bool:
         """异步启动；已有侦察在跑时返回 False。"""
-        if self.is_running():
+        if not self._lock.acquire(blocking=False):
             return False
-        threading.Thread(
-            target=self._safe_run, args=(mac, ip),
-            daemon=True, name="lanscope-recon",
-        ).start()
+        try:
+            self.status = {
+                "running": True, "mac": mac, "stage": "全端口扫描",
+                "started": time.time(),
+            }
+            threading.Thread(
+                target=self._safe_run, args=(mac, ip),
+                daemon=True, name="lanscope-recon",
+            ).start()
+        except Exception:
+            self.status["running"] = False
+            self._lock.release()
+            return False
         return True
 
     def auto_trigger(self, mac: str, ip: Optional[str]) -> None:

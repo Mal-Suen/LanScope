@@ -6,17 +6,22 @@ OUI 库免维护：首次使用自动下载 IEEE 全量库并缓存，超过 30 
 """
 from __future__ import annotations
 
+import ipaddress
 import json
+import logging
 import re
 import socket
 import threading
 import time
+import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Set
 
 from .netinfo import _run_cmd, norm_mac
+
+logger = logging.getLogger(__name__)
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 OUI_CACHE = DATA_DIR / "oui.json"
@@ -416,6 +421,26 @@ def ssdp_discover(timeout: float = 3.0) -> Dict[str, Dict[str, str]]:
     return out
 
 
+def _ssdp_location_ok(loc: str) -> bool:
+    """校验 SSDP LOCATION：仅 http／https，且主机为私网或链路本地 IP。
+
+    主机名只认 IP 字面量：域名需经 DNS 解析，校验通过后 urlopen 仍会
+    再次解析，两次结果可能不一致（DNS rebinding），故一律拒绝。
+    任何解析失败同样返回 False，由调用方安全跳过该 LOCATION。
+    """
+    try:
+        parsed = urllib.parse.urlparse(loc)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        host = parsed.hostname
+        if not host:
+            return False
+        addr = ipaddress.ip_address(host)
+        return addr.is_private or addr.is_link_local
+    except Exception:
+        return False
+
+
 def ssdp_details(
     discovered: Dict[str, Dict[str, str]], timeout: float = 3.0, max_fetch: int = 24
 ) -> Dict[str, Dict[str, str]]:
@@ -429,6 +454,11 @@ def ssdp_details(
     for ip, info in list(discovered.items())[:max_fetch]:
         loc = info.get("location", "")
         if not loc:
+            continue
+        if not _ssdp_location_ok(loc):
+            logger.warning(
+                "已丢弃 SSDP LOCATION（非 http(s) 或主机非私网 IP）：%s（设备 %s）", loc, ip
+            )
             continue
         try:
             req = urllib.request.Request(loc, headers={"User-Agent": "LanScope/1.0"})

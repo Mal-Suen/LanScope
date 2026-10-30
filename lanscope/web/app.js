@@ -83,10 +83,17 @@ function typeOf(d) {
   return d.type || "unknown";
 }
 
+/* 服务端注入的一次性令牌（index.html 的 meta 标签），写请求须携带。 */
+const AUTH_TOKEN =
+  (document.querySelector('meta[name="lanscope-token"]') || {}).content || "";
+
 async function api(path, method, body) {
   const res = await fetch(path, {
     method: method || "POST",
-    headers: body ? { "Content-Type": "application/json" } : undefined,
+    headers: {
+      ...(body ? { "Content-Type": "application/json" } : {}),
+      "X-Auth-Token": AUTH_TOKEN,
+    },
     body: body ? JSON.stringify(body) : undefined,
   });
   return res.json().catch(() => ({}));

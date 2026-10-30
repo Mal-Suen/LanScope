@@ -5,6 +5,8 @@
 from __future__ import annotations
 
 import json
+import re
+import secrets
 import threading
 import time
 import webbrowser
@@ -22,6 +24,13 @@ from .recon import ReconRunner
 from .store import Store
 
 WEB_DIR = Path(__file__).resolve().parent / "web"
+
+# 一次性访问令牌：run_server 启动时生成，注入控制台页面并校验全部写请求。
+# 自定义请求头会触发跨域预检且预检必失败，可阻断恶意网页以 simple request 直发写操作。
+_AUTH_TOKEN = ""
+
+# Host 头白名单：仅本机回环域名（可带端口），挡 DNS rebinding 后的同源读取。
+_HOST_RE = re.compile(r"^(127\.0\.0\.1|localhost)(:\d+)?$", re.IGNORECASE)
 
 _TYPE_LABELS = {
     "router": "路由器",
@@ -198,6 +207,23 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args) -> None:  # 静默访问日志
         pass
 
+    # ---------- 访问防护 ----------
+
+    def _check_host(self) -> bool:
+        """Host 校验：仅放行 127.0.0.1／localhost（可带端口），防 DNS rebinding。"""
+        if _HOST_RE.match(self.headers.get("Host") or ""):
+            return True
+        self._json({"error": "禁止访问：Host 校验未通过"}, 403)
+        return False
+
+    def _check_token(self) -> bool:
+        """写请求令牌校验：X-Auth-Token 须与启动时生成的一次性令牌一致。"""
+        sent = (self.headers.get("X-Auth-Token") or "").encode("utf-8", "ignore")
+        if _AUTH_TOKEN and secrets.compare_digest(sent, _AUTH_TOKEN.encode("ascii")):
+            return True
+        self._json({"error": "禁止访问：令牌校验未通过"}, 403)
+        return False
+
     # ---------- 基础响应 ----------
 
     def _json(self, obj: Dict[str, Any], status: int = 200) -> None:
@@ -221,6 +247,12 @@ class Handler(BaseHTTPRequestHandler):
             ".svg": "image/svg+xml",
         }.get(path.suffix, "application/octet-stream")
         body = path.read_bytes()
+        if name == "index.html" and _AUTH_TOKEN:
+            # 把一次性令牌以 meta 标签注入页面，供前端写请求携带 X-Auth-Token
+            meta = f'<meta name="lanscope-token" content="{_AUTH_TOKEN}">'
+            body = body.decode("utf-8").replace(
+                "</head>", meta + "</head>", 1
+            ).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", ctype)
         self.send_header("Cache-Control", "no-cache")
@@ -260,6 +292,8 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         app = self.app
+        if not self._check_host():
+            return
         try:
             if path in ("/", "/index.html"):
                 self._static("index.html")
@@ -305,6 +339,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlparse(self.path).path
         app = self.app
+        if not self._check_host():
+            return
+        if not self._check_token():
+            return
         try:
             if path == "/api/scan":
                 result = app.trigger_scan()
@@ -336,6 +374,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_PATCH(self) -> None:
         path = urlparse(self.path).path
+        if not self._check_host():
+            return
+        if not self._check_token():
+            return
         try:
             if path.startswith("/api/devices/"):
                 mac = unquote(path.split("/")[3])
@@ -348,6 +390,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def run_server(app: LanScopeApp) -> None:
+    global _AUTH_TOKEN
+    _AUTH_TOKEN = secrets.token_urlsafe(24)
     Handler.app = app
     server = ThreadingHTTPServer(("127.0.0.1", app.port), Handler)
     server.daemon_threads = True
@@ -355,6 +399,7 @@ def run_server(app: LanScopeApp) -> None:
     url = f"http://127.0.0.1:{app.port}/"
     print(f"LanScope {__version__}（{APP_NAME_CN}）已启动：{url}")
     print(f"网络环境：{app.env.describe()}")
+    print("已启用访问防护：Host 校验＋写请求令牌（令牌仅注入控制台页面，不打印）。")
     print("按 Ctrl+C 停止。")
     if app.open_browser:
         threading.Timer(0.8, webbrowser.open, args=(url,)).start()
